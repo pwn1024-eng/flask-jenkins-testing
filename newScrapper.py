@@ -1,10 +1,12 @@
 
 import html
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import re
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from urllib.parse import quote_plus, urljoin
 
@@ -31,6 +33,8 @@ QUERY_COLUMN = "Google Maps Search Query"
 POLL_INTERVAL = 600  # seconds between checks of the input files (10 min)
 SCRAPE_RETRY_DELAY = 600  # seconds before re-scraping a failed query
 FILE_OPEN_RECHECK = 30  # seconds between checks of an input file open in Excel
+LOG_SERVER_PORT = 9999
+MAX_LOG_LINES = 2000
 
 # Selectors matched to the HTML you shared
 CARD_SELECTOR = 'div[role="article"].Nv2PK'
@@ -73,6 +77,73 @@ TRACKING_COLUMNS = [
 # Set on error or Ctrl+C to stop the scraper.
 stop_event = threading.Event()
 errors = []
+log_lines = deque(maxlen=MAX_LOG_LINES)
+log_lock = threading.Lock()
+
+
+def log_message(message):
+    message = str(message)
+    with log_lock:
+        log_lines.extend(
+            f"{now()} {line}" for line in message.splitlines() if line
+        )
+    print(message, flush=True)
+
+
+class LogRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            content = b"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scraper Live Logs</title>
+  <style>
+    body { margin: 0; padding: 1rem; background: #111; color: #eee;
+           font: 14px/1.5 Consolas, monospace; }
+    h1 { font: 600 1.1rem system-ui, sans-serif; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Scraper Live Logs</h1>
+  <pre id="logs">Connecting...</pre>
+  <script>
+    async function refreshLogs() {
+      try {
+        const response = await fetch('/logs', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        document.getElementById('logs').textContent = await response.text();
+        window.scrollTo(0, document.body.scrollHeight);
+      } catch (error) {
+        document.getElementById('logs').textContent =
+          `Unable to load logs: ${error}`;
+      }
+    }
+    refreshLogs();
+    setInterval(refreshLogs, 1000);
+  </script>
+</body>
+</html>"""
+            content_type = "text/html; charset=utf-8"
+        elif self.path == "/logs":
+            with log_lock:
+                content = "\n".join(log_lines).encode("utf-8")
+            content_type = "text/plain; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def log_message(self, _format, *_args):
+        pass
 
 
 class Stopped(Exception):
@@ -230,7 +301,7 @@ def scrape_query(page, query):
         timeout=60000
     )
 
-    print("If prompted, complete any normal browser steps manually.")
+    log_message("If prompted, complete any normal browser steps manually.")
     page.wait_for_timeout(5000)
 
     cards = page.locator(CARD_SELECTOR)
@@ -262,7 +333,7 @@ def scrape_query(page, query):
             records.append(row)
             new_this_round += 1
 
-            print(
+            log_message(
                 f'{len(records)}. {name} | '
                 f'{row["mobile_number"]} | '
                 f'{row["rating"]} | '
@@ -272,7 +343,7 @@ def scrape_query(page, query):
             if len(records) >= MAX_LISTINGS:
                 break
 
-        print(
+        log_message(
             f"Listings collected: {len(records)}"
         )
 
@@ -285,7 +356,7 @@ def scrape_query(page, query):
             idle_scrolls = 0
 
         if idle_scrolls >= MAX_IDLE_SCROLLS:
-            print("No new listings found after scrolling.")
+            log_message("No new listings found after scrolling.")
             break
 
         # Scroll the results panel to load additional cards.
@@ -351,19 +422,19 @@ def read_queries():
     queries = []
     for input_file in input_files():
         if is_open(input_file):
-            print(f"Skipping {input_file}: open in Excel.")
+            log_message(f"Skipping {input_file}: open in Excel.")
             continue
         try:
             workbook = load_workbook(input_file, read_only=True)
         except PermissionError:
-            print(f"Skipping {input_file}: locked by another program.")
+            log_message(f"Skipping {input_file}: locked by another program.")
             continue
         rows = list(workbook.active.iter_rows(values_only=True))
         workbook.close()
 
         headers = [text(header) for header in rows[0]] if rows else []
         if QUERY_COLUMN not in headers:
-            print(f'Skipping {input_file}: no "{QUERY_COLUMN}" column.')
+            log_message(f'Skipping {input_file}: no "{QUERY_COLUMN}" column.')
             continue
         queries += [
             {"_file": input_file, "_row": number, **dict(zip(headers, values))}
@@ -392,7 +463,7 @@ def update_row(row, values):
             except PermissionError:
                 pass  # Locked by another program; wait as for Excel.
         if not waiting:
-            print(
+            log_message(
                 f"{input_file} is open or locked; close it to save "
                 f"{text(row[QUERY_COLUMN])}. Checking every "
                 f"{FILE_OPEN_RECHECK} s."
@@ -418,7 +489,7 @@ def write_row(row, values):
             if text(sheet.cell(r, query_column).value) == query
         ), None)
         if number is None:
-            print(f"Row no longer in {input_file}: {query}")
+            log_message(f"Row no longer in {input_file}: {query}")
             return
         row["_row"] = number
 
@@ -533,7 +604,7 @@ def format_descriptions(file_name):
 
 def scrape_row(page, row):
     query = text(row[QUERY_COLUMN])
-    print(f"\n===== {query} =====")
+    log_message(f"\n===== {query} =====")
     update_row(row, {
         "Scraped?": "Started",
         "Start_Date/Time": now(),
@@ -546,7 +617,7 @@ def scrape_row(page, row):
         # Left as "Started"; scraped again on the next run.
         raise
     except Exception as error:
-        print(f"Failed: {query} -> {error}")
+        log_message(f"Failed: {query} -> {error}")
         update_row(row, {"Scraped?": "Failed", "End_Date/Time": now()})
         return False
 
@@ -570,7 +641,7 @@ def scrape_row(page, row):
         "End_Date/Time": now(),
     }
     update_row(row, values)
-    print(f"Export complete: {len(df)} records saved to {file_name}")
+    log_message(f"Export complete: {len(df)} records saved to {file_name}")
     return True
 
 
@@ -596,10 +667,10 @@ def scrape_worker(playwright):
             ), None)
             if row is None:
                 if browser:
-                    print("Nothing left to scrape; closing the browser.")
+                    log_message("Nothing left to scrape; closing the browser.")
                     browser.close()
                     browser = page = None
-                print(
+                log_message(
                     f"No queries to scrape; checking again in "
                     f"{POLL_INTERVAL // 60} min."
                 )
@@ -612,7 +683,7 @@ def scrape_worker(playwright):
                 )
             if row["_file"] != current_file:
                 current_file = row["_file"]
-                print(f"\n##### Input file: {current_file} #####")
+                log_message(f"\n##### Input file: {current_file} #####")
             if not scrape_row(page, row):
                 failed[row_key(row)] = time.time()
     finally:
@@ -624,9 +695,15 @@ def main():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(
+    server = ThreadingHTTPServer(("0.0.0.0", LOG_SERVER_PORT), LogRequestHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    log_message(
         f"Running. Watching {INPUT_DIR}/ every {POLL_INTERVAL // 60} min; "
         "files run in order _1, _2, _3 ...; press Ctrl+C to stop."
+    )
+    log_message(
+        f"Live logs available at http://<server-ip>:{LOG_SERVER_PORT}"
     )
 
     try:
@@ -635,14 +712,17 @@ def main():
     except Stopped:
         pass
     except KeyboardInterrupt:
-        print("\nStopping...")
+        log_message("\nStopping...")
     except Exception as error:
         fail(error)
     finally:
         stop_event.set()
+        if errors:
+            log_message(f"\nERROR - stopped: {errors[0]}")
+        server.shutdown()
+        server.server_close()
 
     if errors:
-        print(f"\nERROR - stopped: {errors[0]}")
         sys.exit(1)
 
 
