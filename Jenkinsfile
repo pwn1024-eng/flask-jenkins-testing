@@ -29,9 +29,10 @@ pipeline {
                     ${SCAN_VENV}/bin/pip install -q -U bandit pip-audit detect-secrets
 
                     echo "=== Bandit: code analysis ==="
+                    echo "=== Bandit: code analysis ==="
                     ${SCAN_VENV}/bin/bandit -q -r ${SCRIPT} -f json -o bandit-report.json || true
-                    ${SCAN_VENV}/bin/bandit -q -r ${SCRIPT}          # printed in the log
-                    ${SCAN_VENV}/bin/bandit -q -r ${SCRIPT} -lll     # fails on HIGH severity only
+                    ${SCAN_VENV}/bin/bandit -q -r ${SCRIPT} || true      # print all findings, never fails
+                    ${SCAN_VENV}/bin/bandit -q -r ${SCRIPT} -lll         # gate: fails only on HIGH
 
                     echo "=== pip-audit: vulnerable dependencies ==="
                     ${SCAN_VENV}/bin/pip-audit -r requirements.txt --no-deps
